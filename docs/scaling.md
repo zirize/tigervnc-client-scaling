@@ -32,6 +32,12 @@ would fail to link. Only X11 is supported.
 - `Integer` ignores the filter: nearest at `floor(min(window / framebuffer))`; when the window
   is smaller than the remote it shrinks like `Fit` with linear.
 - `IntegerPlus` falls back to nearest at exact integer factors and to linear when shrinking.
+- Between 1x and 2x (e.g. 1080 → 1800) N = 1, so the nearest pass is a 1:1 copy and the
+  output equals `Linear`; the two-pass path still runs (one extra copy, same pixels).
+- Under Xwayland with the compositor's "applications scale themselves" mode, the viewer draws
+  at physical pixels: one bilinear resample. A GTK3 Wayland client at a fractional scale draws
+  at buffer scale 2 and the compositor shrinks it again (e.g. 1080 → 2400 → 1800), which is
+  why the same "linear" looks much softer in such a viewer.
 - Letterbox colour is the stock window background (40,40,40), not black.
 
 ## Structure
