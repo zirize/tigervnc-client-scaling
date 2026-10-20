@@ -1,0 +1,827 @@
+From 221a3fedf377f668cb09f2a9d17e36cd7255ebb6 Mon Sep 17 00:00:00 2001
+From: zirize <zirize@gmail.com>
+Date: Wed, 21 Oct 2026 00:33:32 +0900
+Subject: [PATCH] vncviewer: client-side scaling (Scale, ScaleFilter, F8 menu)
+
+Scale=Off|Fit|Stretch|Integer scales the remote framebuffer to the
+window with XRender; ScaleFilter=Nearest|Linear|IntegerPlus picks the
+filter for Fit and Stretch. IntegerPlus scales by the largest integer
+with nearest into an intermediate surface, then fills the rest with
+bilinear. While scaling, RemoteResize is suspended.
+
+The F8 menu gets a "Display mode" radio submenu that picks how the
+session follows the window: resize the remote session, no resize
+(scrollbars), or scale locally to fit, stretch or by an integer; and
+a "Scale filter" submenu. Changes last for the session.
+
+Scale=Off (the default) behaves exactly like stock. X11 only.
+---
+ vncviewer/DesktopWindow.cxx |  66 +++++--
+ vncviewer/DesktopWindow.h   |   3 +
+ vncviewer/Surface.h         |   7 +
+ vncviewer/Surface_X11.cxx   |  36 ++++
+ vncviewer/Viewport.cxx      | 357 ++++++++++++++++++++++++++++++++++--
+ vncviewer/Viewport.h        |  35 ++++
+ vncviewer/parameters.cxx    |  11 ++
+ vncviewer/parameters.h      |   2 +
+ 8 files changed, 489 insertions(+), 28 deletions(-)
+
+diff --git a/vncviewer/DesktopWindow.cxx b/vncviewer/DesktopWindow.cxx
+index 49b1b8b..3e07a5b 100644
+--- a/vncviewer/DesktopWindow.cxx
++++ b/vncviewer/DesktopWindow.cxx
+@@ -317,7 +317,7 @@ void DesktopWindow::resizeFramebuffer(int new_w, int new_h)
+ {
+   bool maximized;
+ 
+-  if ((new_w == viewport->w()) && (new_h == viewport->h()))
++  if ((new_w == viewport->fbWidth()) && (new_h == viewport->fbHeight()))
+     return;
+ 
+   maximized = false;
+@@ -357,15 +357,19 @@ void DesktopWindow::resizeFramebuffer(int new_w, int new_h)
+ 
+   // If we're letting the viewport match the window perfectly, then
+   // keep things that way for the new size, otherwise just keep things
+-  // like they are.
+-  if (!fullscreen_active() && !maximized) {
++  // like they are. When scaling, the window keeps its size.
++  if (!fullscreen_active() && !maximized && !viewport->isScaling()) {
+     if ((w() == viewport->w()) && (h() == viewport->h()))
+       size(new_w, new_h);
+   }
+ 
+-  viewport->size(new_w, new_h);
++  viewport->resizeFramebuffer(new_w, new_h);
+ 
+   repositionWidgets();
++
++  // The scale factor changed, so everything needs redrawing
++  if (viewport->isScaling())
++    redraw();
+ }
+ 
+ 
+@@ -383,19 +387,18 @@ void DesktopWindow::setCursorPos(const rfb::Point& pos)
+     // Do nothing if we do not have the mouse captured.
+     return;
+   }
++  rfb::Point win_pos = viewport->fromFramebuffer(pos);
+ #if defined(WIN32)
+-  SetCursorPos(pos.x + x_root() + viewport->x(),
+-               pos.y + y_root() + viewport->y());
++  SetCursorPos(win_pos.x + x_root(), win_pos.y + y_root());
+ #elif defined(__APPLE__)
+   CGPoint new_pos;
+-  new_pos.x = pos.x + x_root() + viewport->x();
+-  new_pos.y = pos.y + y_root() + viewport->y();
++  new_pos.x = win_pos.x + x_root();
++  new_pos.y = win_pos.y + y_root();
+   CGWarpMouseCursorPosition(new_pos);
+ #else // Assume this is Xlib
+   Window rootwindow = DefaultRootWindow(fl_display);
+   XWarpPointer(fl_display, rootwindow, rootwindow, 0, 0, 0, 0,
+-               pos.x + x_root() + viewport->x(),
+-               pos.y + y_root() + viewport->y());
++               win_pos.x + x_root(), win_pos.y + y_root());
+ #endif
+ }
+ 
+@@ -665,7 +668,8 @@ void DesktopWindow::resize(int x, int y, int w, int h)
+     // d) We're not still waiting for startup fullscreen to kick in
+     //
+     if (not firstUpdate and not delayedFullscreen and
+-        ::remoteResize and cc->server.supportsSetDesktopSize) {
++        ::remoteResize and cc->server.supportsSetDesktopSize and
++        not viewport->isScaling()) {
+       // We delay updating the remote desktop as we tend to get a flood
+       // of resize events as the user is dragging the window.
+       Fl::remove_timeout(handleResizeTimeout, this);
+@@ -858,7 +862,7 @@ int DesktopWindow::handle(int event)
+       }
+ #endif
+     }
+-    if (fullscreen_active()) {
++    if (fullscreen_active() && !viewport->isScaling()) {
+       // calculate width of "edge" regions
+       edge_scroll_size_x = w() / EDGE_SCROLL_SIZE;
+       edge_scroll_size_y = h() / EDGE_SCROLL_SIZE;
+@@ -1276,7 +1280,7 @@ void DesktopWindow::handleDesktopSize()
+       return;
+ 
+     remoteResize(width, height);
+-  } else if (::remoteResize) {
++  } else if (::remoteResize && !viewport->isScaling()) {
+     // No explicit size, but remote resizing is on so make sure it
+     // matches whatever size the window ended up being
+     remoteResize(w(), h());
+@@ -1436,6 +1440,26 @@ void DesktopWindow::repositionWidgets()
+ {
+   int new_x, new_y;
+ 
++  // When scaling, the viewport covers the whole window and there is
++  // nothing to scroll
++  if (viewport->isScaling()) {
++    if ((viewport->x() != 0) || (viewport->y() != 0) ||
++        (viewport->w() != w()) || (viewport->h() != h())) {
++      viewport->resize(0, 0, w(), h());
++      damage(FL_DAMAGE_ALL);
++    }
++    hscroll->hide();
++    vscroll->hide();
++    return;
++  }
++
++  // Back from scaling, or a new framebuffer size
++  if ((viewport->w() != viewport->fbWidth()) ||
++      (viewport->h() != viewport->fbHeight())) {
++    viewport->size(viewport->fbWidth(), viewport->fbHeight());
++    damage(FL_DAMAGE_ALL);
++  }
++
+   // Viewport position
+ 
+   new_x = viewport->x();
+@@ -1518,6 +1542,20 @@ void DesktopWindow::repositionWidgets()
+   vscroll->value(vscroll->clamp(vscroll->value()));
+ }
+ 
++void DesktopWindow::updateScaling()
++{
++  viewport->updateScale();
++  repositionWidgets();
++
++  // Let the remote side follow the window (again)
++  if (!viewport->isScaling() && !firstUpdate && ::remoteResize &&
++      cc->server.supportsSetDesktopSize &&
++      ((viewport->fbWidth() != w()) || (viewport->fbHeight() != h())))
++    remoteResize(w(), h());
++
++  redraw();
++}
++
+ void DesktopWindow::handleClose(Fl_Widget* /*wnd*/, void* /*data*/)
+ {
+   disconnect();
+@@ -1591,7 +1629,7 @@ void DesktopWindow::handleEdgeScroll(void *data)
+ 
+   assert(self);
+ 
+-  if (!self->fullscreen_active())
++  if (!self->fullscreen_active() || self->viewport->isScaling())
+     return;
+ 
+   mx = Fl::event_x();
+diff --git a/vncviewer/DesktopWindow.h b/vncviewer/DesktopWindow.h
+index ce7960c..67122b5 100644
+--- a/vncviewer/DesktopWindow.h
++++ b/vncviewer/DesktopWindow.h
+@@ -79,6 +79,9 @@ public:
+ 
+   void fullscreen_on();
+ 
++  // Scale, ScaleFilter or RemoteResize changed at runtime
++  void updateScaling();
++
+ private:
+   static void menuOverlay(void *data);
+ 
+diff --git a/vncviewer/Surface.h b/vncviewer/Surface.h
+index 60e452b..1160b42 100644
+--- a/vncviewer/Surface.h
++++ b/vncviewer/Surface.h
+@@ -46,6 +46,13 @@ public:
+   void draw(Surface* dst, int src_x, int src_y, int dst_x, int dst_y,
+             int dst_w, int dst_h);
+ 
++  // Scaled copy: destination pixel (px, py) is sampled from this
++  // surface at ((px - org_x) / sx, (py - org_y) / sy). Only the
++  // destination rectangle dst_x/dst_y/dst_w/dst_h is written. Edges
++  // are padded rather than faded. Only implemented for X11.
++  void drawScaled(Surface* dst, double sx, double sy, int org_x, int org_y,
++                  int dst_x, int dst_y, int dst_w, int dst_h, bool smooth);
++
+   void blend(int src_x, int src_y, int dst_x, int dst_y,
+              int dst_w, int dst_h, int a=255);
+   void blend(Surface* dst, int src_x, int src_y, int dst_x, int dst_y,
+diff --git a/vncviewer/Surface_X11.cxx b/vncviewer/Surface_X11.cxx
+index e73985f..d214346 100644
+--- a/vncviewer/Surface_X11.cxx
++++ b/vncviewer/Surface_X11.cxx
+@@ -61,6 +61,42 @@ void Surface::draw(Surface* dst, int src_x, int src_y,
+                    src_x, src_y, 0, 0, dst_x, dst_y, dst_w, dst_h);
+ }
+ 
++void Surface::drawScaled(Surface* dst, double sx, double sy,
++                         int org_x, int org_y, int dst_x, int dst_y,
++                         int dst_w, int dst_h, bool smooth)
++{
++  XTransform scale = {{
++    { XDoubleToFixed(1.0 / sx), 0, 0 },
++    { 0, XDoubleToFixed(1.0 / sy), 0 },
++    { 0, 0, XDoubleToFixed(1.0) }
++  }};
++  XTransform identity = {{
++    { XDoubleToFixed(1.0), 0, 0 },
++    { 0, XDoubleToFixed(1.0), 0 },
++    { 0, 0, XDoubleToFixed(1.0) }
++  }};
++  XRenderPictureAttributes attr;
++
++  XRenderSetPictureTransform(fl_display, picture, &scale);
++  XRenderSetPictureFilter(fl_display, picture,
++                          smooth ? FilterBilinear : FilterNearest,
++                          nullptr, 0);
++  // Without padding, bilinear sampling fades into transparent black
++  // along the right and bottom edges
++  attr.repeat = RepeatPad;
++  XRenderChangePicture(fl_display, picture, CPRepeat, &attr);
++
++  XRenderComposite(fl_display, PictOpSrc, picture, None, dst->picture,
++                   dst_x - org_x, dst_y - org_y, 0, 0,
++                   dst_x, dst_y, dst_w, dst_h);
++
++  // Other users of this picture expect a plain 1:1 copy
++  XRenderSetPictureTransform(fl_display, picture, &identity);
++  XRenderSetPictureFilter(fl_display, picture, FilterNearest, nullptr, 0);
++  attr.repeat = RepeatNone;
++  XRenderChangePicture(fl_display, picture, CPRepeat, &attr);
++}
++
+ static Picture alpha_mask(int a)
+ {
+   Pixmap pixmap;
+diff --git a/vncviewer/Viewport.cxx b/vncviewer/Viewport.cxx
+index 1359b57..b72fece 100644
+--- a/vncviewer/Viewport.cxx
++++ b/vncviewer/Viewport.cxx
+@@ -22,6 +22,7 @@
+ #endif
+ 
+ #include <assert.h>
++#include <math.h>
+ #include <stdio.h>
+ #include <string.h>
+ 
+@@ -76,7 +77,15 @@ static rfb::LogWriter vlog("Viewport");
+ 
+ enum { ID_DISCONNECT, ID_FULLSCREEN, ID_MINIMIZE, ID_RESIZE,
+        ID_CTRL, ID_ALT, ID_MENUKEY, ID_CTRLALTDEL,
+-       ID_REFRESH, ID_OPTIONS, ID_INFO, ID_ABOUT };
++       ID_REFRESH, ID_OPTIONS, ID_INFO, ID_ABOUT,
++       ID_SUBMENU,
++       ID_MODE_REMOTE, ID_MODE_NONE,
++       ID_SCALE_FIT, ID_SCALE_STRETCH, ID_SCALE_INTEGER,
++       ID_FILTER_NEAREST, ID_FILTER_LINEAR, ID_FILTER_INTEGERPLUS };
++
++// Parameter values in the order of the menu IDs above
++static const char* scaleModeNames[] = { "Fit", "Stretch", "Integer" };
++static const char* scaleFilterNames[] = { "Nearest", "Linear", "IntegerPlus" };
+ 
+ // Used for fake key presses from the menu
+ static const int FAKE_CTRL_KEY_CODE = 0x10001;
+@@ -92,7 +101,9 @@ Viewport::Viewport(int w, int h, const rfb::PixelFormat& /*serverPF*/, CConn* cc
+     keyboard(nullptr),
+     firstLEDState(true), pendingClientClipboard(false),
+     menuCtrlKey(false), menuAltKey(false), cursor(nullptr),
+-    cursorIsBlank(false)
++    cursorIsBlank(false), scaling(SCALE_OFF), filter(FILTER_LINEAR),
++    scaleX(1.0), scaleY(1.0), intermediate(nullptr),
++    intermediateX(0), intermediateY(0), intermediateStale(true)
+ {
+ #if defined(WIN32)
+   keyboard = new KeyboardWin32(this);
+@@ -128,6 +139,8 @@ Viewport::Viewport(int w, int h, const rfb::PixelFormat& /*serverPF*/, CConn* cc
+ 
+   // Make sure we have an initial blank cursor set
+   setCursor(0, 0, rfb::Point(0, 0), nullptr);
++
++  updateScale();
+ }
+ 
+ 
+@@ -151,6 +164,8 @@ Viewport::~Viewport()
+ 
+   delete keyboard;
+ 
++  delete intermediate;
++
+   // FLTK automatically deletes all child widgets, so we shouldn't touch
+   // them ourselves here
+ }
+@@ -170,7 +185,27 @@ void Viewport::updateWindow()
+   Rect r;
+ 
+   r = frameBuffer->getDamage();
+-  damage(FL_DAMAGE_USER1, r.tl.x + x(), r.tl.y + y(), r.width(), r.height());
++
++  if (!isScaling()) {
++    damage(FL_DAMAGE_USER1, r.tl.x + x(), r.tl.y + y(), r.width(), r.height());
++    return;
++  }
++
++  if (r.is_empty())
++    return;
++
++  intermediateDamage.assign_union(rfb::Region(r));
++
++  // Map to window space, with a pixel of margin for the filters
++  Rect wr;
++  wr.tl.x = (int)floor(r.tl.x * scaleX) - 1;
++  wr.tl.y = (int)floor(r.tl.y * scaleY) - 1;
++  wr.br.x = (int)ceil(r.br.x * scaleX) + 1;
++  wr.br.y = (int)ceil(r.br.y * scaleY) + 1;
++  wr = wr.translate(imageRect.tl).intersect(imageRect);
++
++  damage(FL_DAMAGE_USER1, wr.tl.x + x(), wr.tl.y + y(),
++         wr.width(), wr.height());
+ }
+ 
+ static const char * dotcursor_xpm[] = {
+@@ -346,10 +381,95 @@ void Viewport::draw(Surface* dst)
+   if ((W == 0) || (H == 0))
+     return;
+ 
++  if (isScaling()) {
++    drawScaled(dst, X, Y, W, H);
++    return;
++  }
++
+   frameBuffer->draw(dst, X - x(), Y - y(), X, Y, W, H);
+ }
+ 
+ 
++void Viewport::drawScaled(Surface* dst, int X, int Y, int W, int H)
++{
++  Rect clip, image;
++  int nx, ny;
++
++  // The letterbox around the image is the window background
++  image = imageRect.translate(Point(x(), y()));
++  clip.setXYWH(X, Y, W, H);
++  clip = clip.intersect(image);
++  if (clip.is_empty())
++    return;
++
++  if ((scaleX == 1.0) && (scaleY == 1.0)) {
++    intermediateStale = true;
++    frameBuffer->draw(dst, clip.tl.x - image.tl.x, clip.tl.y - image.tl.y,
++                      clip.tl.x, clip.tl.y, clip.width(), clip.height());
++    return;
++  }
++
++  nx = (int)floor(scaleX);
++  ny = (int)floor(scaleY);
++
++  // Integer mode is nearest by definition. IntegerPlus degrades to
++  // nearest at exact integer factors and to linear when shrinking.
++  if ((scaling == SCALE_INTEGER) || (filter != FILTER_INTEGERPLUS) ||
++      (nx < 1) || (ny < 1) || ((nx == scaleX) && (ny == scaleY))) {
++    bool smooth;
++
++    if ((scaling == SCALE_INTEGER) || (filter == FILTER_INTEGERPLUS))
++      smooth = (nx < 1) || (ny < 1);
++    else
++      smooth = filter == FILTER_LINEAR;
++
++    intermediateStale = true;
++    frameBuffer->drawScaled(dst, scaleX, scaleY, image.tl.x, image.tl.y,
++                            clip.tl.x, clip.tl.y,
++                            clip.width(), clip.height(), smooth);
++    return;
++  }
++
++  // IntegerPlus: nearest to an integer multiple, then linear for the
++  // rest. The intermediate copy is kept up to date from framebuffer
++  // damage, so the second pass may sample anywhere in it.
++
++  if ((intermediate == nullptr) || (intermediateX != nx) ||
++      (intermediateY != ny) ||
++      (intermediate->width() != fbWidth() * nx) ||
++      (intermediate->height() != fbHeight() * ny)) {
++    delete intermediate;
++    intermediate = new Surface(fbWidth() * nx, fbHeight() * ny);
++    intermediateX = nx;
++    intermediateY = ny;
++    intermediateStale = true;
++  }
++
++  if (intermediateStale) {
++    intermediateDamage.clear();
++    intermediateDamage.assign_union(rfb::Region(frameBuffer->getRect()));
++    intermediateStale = false;
++  }
++
++  if (!intermediateDamage.is_empty()) {
++    std::vector<Rect> rects;
++
++    intermediateDamage.get_rects(&rects);
++    for (const Rect& r : rects) {
++      frameBuffer->drawScaled(intermediate, nx, ny, 0, 0,
++                              r.tl.x * nx, r.tl.y * ny,
++                              r.width() * nx, r.height() * ny, false);
++    }
++    intermediateDamage.clear();
++  }
++
++  intermediate->drawScaled(dst, scaleX / nx, scaleY / ny,
++                           image.tl.x, image.tl.y,
++                           clip.tl.x, clip.tl.y,
++                           clip.width(), clip.height(), true);
++}
++
++
+ void Viewport::draw()
+ {
+   int X, Y, W, H;
+@@ -365,16 +485,149 @@ void Viewport::draw()
+ 
+ void Viewport::resize(int x, int y, int w, int h)
+ {
+-  if ((w != frameBuffer->width()) || (h != frameBuffer->height())) {
+-    vlog.debug("Resizing framebuffer from %dx%d to %dx%d",
+-               frameBuffer->width(), frameBuffer->height(), w, h);
++  Fl_Widget::resize(x, y, w, h);
+ 
+-    frameBuffer = new PlatformPixelBuffer(w, h);
+-    assert(frameBuffer);
+-    cc->setFramebuffer(frameBuffer);
++  updateScale();
++}
++
++
++int Viewport::fbWidth()
++{
++  return frameBuffer->width();
++}
++
++
++int Viewport::fbHeight()
++{
++  return frameBuffer->height();
++}
++
++
++void Viewport::resizeFramebuffer(int w, int h)
++{
++  if ((w == frameBuffer->width()) && (h == frameBuffer->height()))
++    return;
++
++  vlog.debug("Resizing framebuffer from %dx%d to %dx%d",
++             frameBuffer->width(), frameBuffer->height(), w, h);
++
++  frameBuffer = new PlatformPixelBuffer(w, h);
++  assert(frameBuffer);
++  cc->setFramebuffer(frameBuffer);
++
++  intermediateStale = true;
++
++  updateScale();
++}
++
++
++void Viewport::updateScale()
++{
++  ScaleMode newScaling;
++  ScaleFilter newFilter;
++  int fbW, fbH, dw, dh;
++
++  if (strcasecmp(scaleMode, "fit") == 0)
++    newScaling = SCALE_FIT;
++  else if (strcasecmp(scaleMode, "stretch") == 0)
++    newScaling = SCALE_STRETCH;
++  else if (strcasecmp(scaleMode, "integer") == 0)
++    newScaling = SCALE_INTEGER;
++  else {
++    if (strcasecmp(scaleMode, "off") != 0)
++      vlog.error("Unknown Scale \"%s\", using Off",
++                 (const char*)scaleMode);
++    newScaling = SCALE_OFF;
+   }
+ 
+-  Fl_Widget::resize(x, y, w, h);
++  if (strcasecmp(scaleFilter, "nearest") == 0)
++    newFilter = FILTER_NEAREST;
++  else if (strcasecmp(scaleFilter, "integerplus") == 0)
++    newFilter = FILTER_INTEGERPLUS;
++  else {
++    if (strcasecmp(scaleFilter, "linear") != 0)
++      vlog.error("Unknown ScaleFilter \"%s\", using Linear",
++                 (const char*)scaleFilter);
++    newFilter = FILTER_LINEAR;
++  }
++
++  // The intermediate copy is not maintained in other modes
++  if ((newScaling != scaling) || (newFilter != filter))
++    intermediateStale = true;
++  if (newScaling == SCALE_OFF)
++    intermediateDamage.clear();
++
++  scaling = newScaling;
++  filter = newFilter;
++
++  fbW = fbWidth();
++  fbH = fbHeight();
++
++  switch (scaling) {
++  case SCALE_STRETCH:
++    scaleX = (double)w() / fbW;
++    scaleY = (double)h() / fbH;
++    dw = w();
++    dh = h();
++    break;
++  case SCALE_INTEGER:
++    scaleX = floor(__rfbmin((double)w() / fbW, (double)h() / fbH));
++    if (scaleX >= 1.0) {
++      scaleY = scaleX;
++      dw = fbW * (int)scaleX;
++      dh = fbH * (int)scaleY;
++      break;
++    }
++    // Window smaller than the remote: shrink to fit
++    // fall through
++  case SCALE_FIT:
++    scaleX = __rfbmin((double)w() / fbW, (double)h() / fbH);
++    scaleY = scaleX;
++    dw = (int)lround(fbW * scaleX);
++    dh = (int)lround(fbH * scaleY);
++    break;
++  default:
++    scaleX = scaleY = 1.0;
++    dw = fbW;
++    dh = fbH;
++    break;
++  }
++
++  if (scaling == SCALE_OFF)
++    imageRect.setXYWH(0, 0, dw, dh);
++  else
++    imageRect.setXYWH((w() - dw) / 2, (h() - dh) / 2, dw, dh);
++}
++
++
++rfb::Point Viewport::toFramebuffer(int ex, int ey)
++{
++  Point pos;
++
++  pos.x = ex - x();
++  pos.y = ey - y();
++
++  if (!isScaling())
++    return pos;
++
++  // Same pixel centre convention as the renderer
++  pos.x = (int)floor((pos.x + 0.5 - imageRect.tl.x) / scaleX);
++  pos.y = (int)floor((pos.y + 0.5 - imageRect.tl.y) / scaleY);
++
++  pos.x = __rfbmax(0, __rfbmin(pos.x, fbWidth() - 1));
++  pos.y = __rfbmax(0, __rfbmin(pos.y, fbHeight() - 1));
++
++  return pos;
++}
++
++
++rfb::Point Viewport::fromFramebuffer(const rfb::Point& pos)
++{
++  if (!isScaling())
++    return Point(pos.x + x(), pos.y + y());
++
++  return Point(x() + imageRect.tl.x + (int)floor((pos.x + 0.5) * scaleX),
++               y() + imageRect.tl.y + (int)floor((pos.y + 0.5) * scaleY));
+ }
+ 
+ 
+@@ -411,7 +664,7 @@ int Viewport::handle(int event)
+   case FL_LEAVE:
+     window()->cursor(FL_CURSOR_DEFAULT);
+     // We want a last move event to help trigger edge stuff
+-    handlePointerEvent(Point(Fl::event_x() - x(), Fl::event_y() - y()), 0);
++    handlePointerEvent(toFramebuffer(Fl::event_x(), Fl::event_y()), 0);
+     return 1;
+ 
+   case FL_PUSH:
+@@ -454,11 +707,11 @@ int Viewport::handle(int event)
+ 
+       // A quick press of the wheel "button", followed by a immediate
+       // release below
+-      handlePointerEvent(Point(Fl::event_x() - x(), Fl::event_y() - y()),
++      handlePointerEvent(toFramebuffer(Fl::event_x(), Fl::event_y()),
+                          buttonMask | wheelMask);
+     } 
+ 
+-    handlePointerEvent(Point(Fl::event_x() - x(), Fl::event_y() - y()), buttonMask);
++    handlePointerEvent(toFramebuffer(Fl::event_x(), Fl::event_y()), buttonMask);
+     return 1;
+ 
+   case FL_FOCUS:
+@@ -695,6 +948,21 @@ int Viewport::handleSystemEvent(void *event, void *data)
+   return 0;
+ }
+ 
++// fltk_menu_add() escapes '/', so it cannot add to a submenu
++static void fltk_submenu_add(Fl_Menu_ *menu, const char *parent,
++                             const char *text, void *data, int flags)
++{
++  char p[256], t[256], buffer[1024];
++
++  if (fltk_menu_escape(parent, p, sizeof(p)) >= sizeof(p))
++    return;
++  if (fltk_menu_escape(text, t, sizeof(t)) >= sizeof(t))
++    return;
++
++  snprintf(buffer, sizeof(buffer), "%s/%s", p, t);
++  menu->add(buffer, 0, nullptr, data, flags);
++}
++
+ // FIXME: gcc confuses ID_DISCONNECT with NULL
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Wzero-as-null-pointer-constant"
+@@ -715,6 +983,49 @@ void Viewport::initContextMenu()
+                 (window()->fullscreen_active()?FL_MENU_INACTIVE:0) |
+                 FL_MENU_DIVIDER);
+ 
++  // How the session follows the window: resize the remote desktop,
++  // do nothing (scrollbars), or scale locally. These exclude each
++  // other, so they share one radio group.
++  const char *modeLabel = p_("ContextMenu|", "Display &mode");
++  const char *modeLabels[] = {
++    p_("ContextMenu|", "&Resize remote session"),
++    p_("ContextMenu|", "&No resize (scrollbars)"),
++    p_("ContextMenu|", "Scale to &fit"),
++    p_("ContextMenu|", "Scale to &stretch"),
++    p_("ContextMenu|", "Scale by &integer")
++  };
++  bool canResize = cc->server.supportsSetDesktopSize;
++  int mode;
++  if (isScaling())
++    mode = 2 + (scaling - SCALE_FIT);
++  else
++    mode = (::remoteResize && canResize) ? 0 : 1;
++  fltk_menu_add(contextMenu, modeLabel, 0, nullptr, (void*)ID_SUBMENU,
++                FL_SUBMENU);
++  for (int i = 0; i < 5; i++)
++    fltk_submenu_add(contextMenu, modeLabel, modeLabels[i],
++                     (void*)(long)(ID_MODE_REMOTE + i),
++                     FL_MENU_RADIO |
++                     (mode == i ? FL_MENU_VALUE : 0) |
++                     ((i == 0) && !canResize ? FL_MENU_INACTIVE : 0) |
++                     (i == 1 ? FL_MENU_DIVIDER : 0));
++
++  // The filter only applies to Fit and Stretch
++  const char *filterLabel = p_("ContextMenu|", "Scale fi&lter");
++  const char *filterLabels[] = {
++    p_("ContextMenu|", "&Nearest"), p_("ContextMenu|", "&Linear"),
++    p_("ContextMenu|", "&Integer+")
++  };
++  int filterFlags = ((scaling == SCALE_FIT) || (scaling == SCALE_STRETCH)) ?
++                    0 : FL_MENU_INACTIVE;
++  fltk_menu_add(contextMenu, filterLabel, 0, nullptr, (void*)ID_SUBMENU,
++                FL_SUBMENU | FL_MENU_DIVIDER);
++  for (int i = 0; i < 3; i++)
++    fltk_submenu_add(contextMenu, filterLabel, filterLabels[i],
++                     (void*)(long)(ID_FILTER_NEAREST + i),
++                     FL_MENU_RADIO | filterFlags |
++                     ((int)filter == i ? FL_MENU_VALUE : 0));
++
+   fltk_menu_add(contextMenu, p_("ContextMenu|", "&Ctrl"),
+                 0, nullptr, (void*)ID_CTRL,
+                 FL_MENU_TOGGLE | (menuCtrlKey?FL_MENU_VALUE:0));
+@@ -799,7 +1110,7 @@ void Viewport::popupContextMenu()
+   case ID_RESIZE:
+     if (window()->fullscreen_active())
+       break;
+-    window()->size(w(), h());
++    window()->size(fbWidth(), fbHeight());
+     break;
+   case ID_CTRL:
+     if (m->value())
+@@ -844,6 +1155,24 @@ void Viewport::popupContextMenu()
+   case ID_ABOUT:
+     about_vncviewer();
+     break;
++  case ID_MODE_REMOTE:
++  case ID_MODE_NONE:
++    scaleMode.setParam("Off");
++    ::remoteResize.setParam(m->argument() == ID_MODE_REMOTE);
++    ((DesktopWindow*)window())->updateScaling();
++    break;
++  case ID_SCALE_FIT:
++  case ID_SCALE_STRETCH:
++  case ID_SCALE_INTEGER:
++    scaleMode.setParam(scaleModeNames[m->argument() - ID_SCALE_FIT]);
++    ((DesktopWindow*)window())->updateScaling();
++    break;
++  case ID_FILTER_NEAREST:
++  case ID_FILTER_LINEAR:
++  case ID_FILTER_INTEGERPLUS:
++    scaleFilter.setParam(scaleFilterNames[m->argument() - ID_FILTER_NEAREST]);
++    ((DesktopWindow*)window())->updateScaling();
++    break;
+   }
+ }
+ 
+diff --git a/vncviewer/Viewport.h b/vncviewer/Viewport.h
+index b2ae0e6..3a7619a 100644
+--- a/vncviewer/Viewport.h
++++ b/vncviewer/Viewport.h
+@@ -21,6 +21,7 @@
+ #define __VIEWPORT_H__
+ 
+ #include <rfb/Rect.h>
++#include <rfb/Region.h>
+ 
+ #include <FL/Fl_Widget.H>
+ 
+@@ -57,6 +58,20 @@ public:
+ 
+   void draw(Surface* dst);
+ 
++  // Remote framebuffer size. Equals the widget size unless scaling.
++  int fbWidth();
++  int fbHeight();
++
++  // New remote framebuffer size (keeps the widget size)
++  void resizeFramebuffer(int w, int h);
++
++  // Client side scaling (Scale and ScaleFilter parameters)
++  bool isScaling() { return scaling != SCALE_OFF; }
++  void updateScale();
++
++  // Framebuffer position to window coordinates (centre of the pixel)
++  rfb::Point fromFramebuffer(const rfb::Point& pos);
++
+   // Clipboard events
+   void handleClipboardRequest();
+   void handleClipboardAnnounce(bool available);
+@@ -83,6 +98,11 @@ private:
+ 
+   void flushPendingClipboard();
+ 
++  // Window event coordinates to framebuffer position
++  rfb::Point toFramebuffer(int ex, int ey);
++
++  void drawScaled(Surface* dst, int X, int Y, int W, int H);
++
+   void handlePointerEvent(const rfb::Point& pos, uint16_t buttonMask);
+   static void handlePointerTimeout(void *data);
+ 
+@@ -129,6 +149,21 @@ private:
+   Fl_RGB_Image *cursor;
+   rfb::Point cursorHotspot;
+   bool cursorIsBlank;
++
++  enum ScaleMode { SCALE_OFF, SCALE_FIT, SCALE_STRETCH, SCALE_INTEGER };
++  enum ScaleFilter { FILTER_NEAREST, FILTER_LINEAR, FILTER_INTEGERPLUS };
++
++  ScaleMode scaling;
++  ScaleFilter filter;
++  // Scale factors, and the image rectangle relative to the widget
++  double scaleX, scaleY;
++  rfb::Rect imageRect;
++  // Integer scaled copy of the framebuffer for FILTER_INTEGERPLUS
++  Surface *intermediate;
++  int intermediateX, intermediateY;
++  bool intermediateStale;
++  // Framebuffer areas changed since the intermediate was last updated
++  rfb::Region intermediateDamage;
+ };
+ 
+ #endif
+diff --git a/vncviewer/parameters.cxx b/vncviewer/parameters.cxx
+index f0ca535..4ed208f 100644
+--- a/vncviewer/parameters.cxx
++++ b/vncviewer/parameters.cxx
+@@ -138,6 +138,17 @@ BoolParameter remoteResize("RemoteResize",
+                            "the size of the local client window changes. "
+                            "(Does not work with all servers)", true);
+ 
++StringParameter scaleMode("Scale",
++                          "Scale the remote desktop to the window on the "
++                          "client side. Should be either Off, Fit, Stretch "
++                          "or Integer. Disables RemoteResize while active",
++                          "Off");
++StringParameter scaleFilter("ScaleFilter",
++                            "Filter used when scaling with Scale=Fit or "
++                            "Stretch. Should be either Nearest, Linear or "
++                            "IntegerPlus",
++                            "Linear");
++
+ BoolParameter viewOnly("ViewOnly",
+                        "Don't send any mouse or keyboard events to the server",
+                        false);
+diff --git a/vncviewer/parameters.h b/vncviewer/parameters.h
+index f9ee28f..d51c0fe 100644
+--- a/vncviewer/parameters.h
++++ b/vncviewer/parameters.h
+@@ -58,6 +58,8 @@ extern MonitorIndicesParameter fullScreenSelectedMonitors;
+ extern rfb::StringParameter desktopSize;
+ extern rfb::StringParameter geometry;
+ extern rfb::BoolParameter remoteResize;
++extern rfb::StringParameter scaleMode;
++extern rfb::StringParameter scaleFilter;
+ 
+ extern rfb::BoolParameter listenMode;
+ 
+-- 
+2.53.0
+
