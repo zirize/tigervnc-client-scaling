@@ -42,4 +42,21 @@ source, then one commit per `patches/*.patch` (applied with `git am`).
   `type -a vncviewer`). On Debian/Ubuntu `/usr/bin/vncviewer` is an alternatives link to the
   stock `/usr/bin/xtigervncviewer`.
 - Desktop menu entries that call `xtigervncviewer` directly still start the stock viewer.
-- Undo: delete `~/.local/bin/vncviewer`.
+- Without the distro `tigervnc-viewer` package there is no `vncviewer.desktop` and no `tigervnc`
+  icon, so the Plasma (Wayland) task manager cannot match the window class `TigerVNC Viewer` and
+  shows the generic Xwayland icon. Install both per user:
+
+  ```bash
+  M=src/tigervnc-1.15.0/media/icons
+  for r in 16 22 24 32 48 64 128; do
+    install -Dm644 $M/tigervnc_$r.png ~/.local/share/icons/hicolor/${r}x${r}/apps/tigervnc.png
+  done
+  install -Dm644 $M/tigervnc.svg ~/.local/share/icons/hicolor/scalable/apps/tigervnc.svg
+  sed "s|^Exec=.*|Exec=$HOME/.local/bin/vncviewer|" build/vncviewer/vncviewer.desktop.in \
+    > ~/.local/share/applications/vncviewer.desktop
+  kbuildsycoca6
+  ```
+
+  The match key is `StartupWMClass=TigerVNC Viewer` (the FLTK `default_xclass` in
+  `vncviewer.cxx`); restart the viewer to see the icon.
+- Undo: delete `~/.local/bin/vncviewer` (and the icon and desktop files above).
