@@ -4,21 +4,21 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>TigerVNC client-side scaling for vncviewer</title>
-<meta name="description" content="A patch for TigerVNC vncviewer 1.15.0 on Linux/X11 that scales the remote desktop to the window on the client: fit, stretch or integer scaling with nearest, bilinear or integer-then-bilinear filtering, switchable from the F8 menu. No nested compositor, so IME and clipboard keep working." />
+<meta name="description" content="A patch for TigerVNC vncviewer 1.15.0 and 1.16.2 on Linux/X11 that scales the remote desktop to the window on the client: fit, stretch or integer scaling with nearest, bilinear or integer-then-bilinear filtering, switchable from the context menu. No nested compositor, so IME and clipboard keep working." />
 <meta name="author" content="zirize" />
 <meta name="robots" content="index, follow" />
 <link rel="canonical" href="https://zirize.github.io/tigervnc-client-scaling/" />
 <meta property="og:type" content="article" />
 <meta property="og:url" content="https://zirize.github.io/tigervnc-client-scaling/" />
 <meta property="og:title" content="TigerVNC client-side scaling for vncviewer" />
-<meta property="og:description" content="Fit, stretch or integer-scale the remote desktop inside TigerVNC's own viewer, with XRender filtering and an F8 menu switch." />
+<meta property="og:description" content="Fit, stretch or integer-scale the remote desktop inside TigerVNC's own viewer, with XRender filtering and a context menu switch." />
 <meta name="twitter:card" content="summary" />
 <script type="application/ld+json">
 {
   "@context": "https://schema.org",
   "@type": "TechArticle",
   "headline": "TigerVNC client-side scaling for vncviewer",
-  "description": "How a small patch adds client-side scaling (fit, stretch, integer) with nearest, bilinear and integer-then-bilinear filters to the TigerVNC 1.15.0 viewer on X11, using XRender, without changing the remote resolution.",
+  "description": "How a small patch adds client-side scaling (fit, stretch, integer) with nearest, bilinear and integer-then-bilinear filters to the TigerVNC 1.15.0 and 1.16.2 viewers on X11, using XRender, without changing the remote resolution.",
   "url": "https://zirize.github.io/tigervnc-client-scaling/",
   "author": { "@type": "Person", "name": "zirize", "url": "https://github.com/zirize" },
   "about": ["TigerVNC", "vncviewer", "VNC", "client-side scaling", "integer scaling", "bilinear filtering", "XRender", "X11", "Xwayland", "remote desktop", "Ubuntu"]
@@ -95,9 +95,9 @@ footer{text-align:center;padding:32px 20px;border-top:1px solid var(--border);co
 <li><strong><code>Scale=Off</code> is pixel-identical to the stock viewer</strong> — the test suite checks it.</li>
 </ul>
 
-<h3>Switch it live from the F8 menu</h3>
+<h3>Switch it live from the context menu</h3>
 
-<p>The F8 context menu gets a <strong>Display mode</strong> submenu — <em>Resize remote session</em>, <em>No resize (scrollbars)</em>, <em>Scale to fit</em>, <em>Scale to stretch</em>, <em>Scale by integer</em> — and a <strong>Scale filter</strong> submenu with <em>Nearest</em>, <em>Linear</em> and <em>Integer+</em>. Changes last for the session.</p>
+<p>The context menu (F8 in 1.15, <code>Ctrl+Alt+M</code> in 1.16) gets a <strong>Display mode</strong> submenu — <em>Resize remote session</em>, <em>No resize (scrollbars)</em>, <em>Scale to fit</em>, <em>Scale to stretch</em>, <em>Scale by integer</em> — and a <strong>Scale filter</strong> submenu with <em>Nearest</em>, <em>Linear</em> and <em>Integer+</em>. Changes last for the session.</p>
 
 <h2>How it works</h2>
 
@@ -105,25 +105,32 @@ footer{text-align:center;padding:32px 20px;border-top:1px solid var(--border);co
 
 <h2>Build</h2>
 
-<p>On Ubuntu, the script fetches the <code>tigervnc_1.15.0+dfsg-2build1</code> source package, applies the Debian patches and this patch, and builds only the viewer:</p>
+<p>There is one patch per TigerVNC version, in <code>patches/1.15.0/</code> and <code>patches/1.16.2/</code>. Use the one matching your distribution: 1.15.0 for Ubuntu 25.10–26.10 (including 26.04 LTS), Debian 13 and Fedora 40–41; 1.16.2 for Arch, Fedora 42+, Gentoo, NixOS 25.11+, openSUSE Tumbleweed, Debian 14 and Ubuntu 27.04.</p>
+
+<p>On Ubuntu, the script fetches the Ubuntu source package of the chosen version, applies the Debian patches and this patch, and builds only the viewer; both versions build on Ubuntu 26.04:</p>
 
 <pre><code>sudo apt install --no-install-recommends \
      libfltk1.3-dev libavcodec-dev libavutil-dev libswscale-dev libpam0g-dev
 git clone https://github.com/zirize/tigervnc-client-scaling
 cd tigervnc-client-scaling
-./build.sh              # -&gt; build/vncviewer/vncviewer</code></pre>
+./build.sh              # 1.15.0 -&gt; build/1.15.0/vncviewer/vncviewer
+./build.sh 1.16.2       # 1.16.2 -&gt; build/1.16.2/vncviewer/vncviewer</code></pre>
 
-<p>Elsewhere, apply the patch to a TigerVNC 1.15.0 tree:</p>
+<p>Elsewhere, apply the patch for your version to a TigerVNC tree:</p>
 
-<pre><code>git clone --branch v1.15.0 https://github.com/TigerVNC/tigervnc.git
-cd tigervnc &amp;&amp; git apply ../tigervnc-client-scaling/patches/0001-*.patch
+<pre><code>git clone --branch v1.16.2 https://github.com/TigerVNC/tigervnc.git
+cd tigervnc &amp;&amp; git apply ../tigervnc-client-scaling/patches/1.16.2/0001-*.patch
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release &amp;&amp; ninja -C build vncviewer</code></pre>
 
 <p>Dependencies and how to rework the patch are in <a href="https://github.com/zirize/tigervnc-client-scaling/blob/main/docs/build.md">docs/build.md</a>.</p>
 
 <h2>Tested on</h2>
 
-<p>Ubuntu 26.04 LTS with KDE Plasma on Wayland (the viewer under Xwayland), TigerVNC <code>1.15.0+dfsg-2build1</code>. On the real desktop, in scale mode: clipboard in both directions, Korean input through an IME running in the remote session (fcitx5-hangul) and fullscreen all work. A headless regression test on private Xvnc displays checks stock parity, every mode against reference images, pointer mapping, partial updates, live resizing and F8 switching, with 0 failures. The patch also applies cleanly to the upstream <code>v1.15.0</code> tag and the viewer built from it passes the same test (stock-parity checks skipped). Other versions have not been tried.</p>
+<p>Ubuntu 26.04 LTS with KDE Plasma on Wayland (the viewer under Xwayland), TigerVNC <code>1.15.0+dfsg-2build1</code>. On the real desktop, in scale mode: clipboard in both directions, Korean input through an IME running in the remote session (fcitx5-hangul) and fullscreen all work. A headless regression test on private Xvnc displays checks stock parity, every mode against reference images, pointer mapping, partial updates, live resizing and menu switching, with 0 failures.</p>
+
+<p>TigerVNC 1.16.2 (the Ubuntu 27.04 source package <code>1.16.2+dfsg-1ubuntu1</code>, built on the same Ubuntu 26.04): the headless test passes with 0 failures, including <code>Scale=Off</code> against an unpatched 1.16.2 build pixel for pixel, and on the real desktop Korean input, clipboard, fullscreen, the <code>Ctrl+Alt+M</code> menu and live resizing all work.</p>
+
+<p>Each patch also applies cleanly to the matching upstream tag (<code>v1.15.0</code>, <code>v1.16.2</code>). Other versions have not been tried.</p>
 
 <div class="note"><strong>X11 only.</strong> The scaled path uses XRender, so Windows and macOS builds of the patched viewer will not link. <code>Scale</code> and <code>ScaleFilter</code> are command-line parameters and are not written to <code>.tigervnc</code> files.</div>
 

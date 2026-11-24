@@ -3,17 +3,21 @@
 # (:91 remote 320x200 that rejects resizes, :92 viewer screen, :93 remote that accepts
 # resizes); the user's desktop is not touched.
 #
-#   tests/scale_test.sh [viewer]     default: build/vncviewer/vncviewer
+#   tests/scale_test.sh [viewer]     default: build/1.15.0/vncviewer/vncviewer
+#   STOCK=<unpatched viewer of the same version> tests/scale_test.sh build/1.16.2/vncviewer/vncviewer
 #
-# Needs: Xvnc (tigervnc-standalone-server), xtigervncviewer (stock, for the parity checks,
-# which are skipped without it),
+# Needs: Xvnc (tigervnc-standalone-server), a stock viewer for the parity checks (default
+# /usr/bin/xtigervncviewer, the distribution's; skipped without it),
 # ImageMagick 7 (magick, import, display), xdotool, xwininfo, xdpyinfo.
 # Prints PASS/FAIL per check; exit status is the number of failures.
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-V=${1:-$HERE/build/vncviewer/vncviewer}
-STOCK=/usr/bin/xtigervncviewer
+V=${1:-$HERE/build/1.15.0/vncviewer/vncviewer}
+STOCK=${STOCK:-/usr/bin/xtigervncviewer}
+# The context menu key: F8 up to 1.15, then Ctrl+Alt+M (ShortcutModifiers, 1.16)
+# (help captured first: grep -q closing the pipe early would fail it under pipefail)
+case $("$V" --help 2>&1) in *ShortcutModifiers*) MENUKEY=ctrl+alt+m ;; *) MENUKEY=F8 ;; esac
 W=$(mktemp -d)
 NET="-AutoSelect=0 -PreferredEncoding=Raw -NoJPEG"   # lossless, deterministic
 fails=0
@@ -188,14 +192,14 @@ sleep 4; grab $a "$W/live.png"; kill $a; wait $a 2>/dev/null
 shot "$V" "$W/fresh.png" 1037x613 -Scale Fit -ScaleFilter IntegerPlus
 check "live resize" "$(ae "$W/live.png" "$W/fresh.png")" 0
 
-echo "== F8 menu switching and RemoteResize (remote :93)"
+echo "== Context menu ($MENUKEY) switching and RemoteResize (remote :93)"
 rsize() { DISPLAY=:93 xdpyinfo | awk '/dimensions/{print $2}'; }
 DISPLAY=:92 "$V" -geometry 900x600+0+0 $NET -Scale Fit localhost::5993 >/dev/null 2>&1 &
 a=$!; sleep 3; winpos $a
 # Menu opens at the pointer (400,300); "Display mode" is the 5th row, its items start at y=410
 menu_mode() { # menu_mode <item y>: 410 Remote, 434 None, 458 Fit, 482 Stretch, 506 Integer
     DISPLAY=:92 xdotool mousemove 400 300; DISPLAY=:92 xdotool windowfocus "$WID"; sleep 0.3
-    DISPLAY=:92 xdotool key F8; sleep 0.8
+    DISPLAY=:92 xdotool key $MENUKEY; sleep 0.8
     DISPLAY=:92 xdotool mousemove 430 410; sleep 0.6
     DISPLAY=:92 xdotool mousemove 600 410; sleep 0.3
     DISPLAY=:92 xdotool mousemove 600 "$1"; sleep 0.3

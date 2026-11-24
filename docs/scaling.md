@@ -1,7 +1,8 @@
 # Client-side scaling (Stage 1) — how it works
 
-Patch: `patches/0001-vncviewer-client-side-scaling-*.patch` (8 files under `vncviewer/`; the
-name is whatever `git format-patch` derives from the commit subject).
+Patches: `patches/1.15.0/0001-*.patch` and `patches/1.16.2/0001-*.patch`, the same change for
+each TigerVNC version (8 files under `vncviewer/`; the name is whatever `git format-patch`
+derives from the commit subject). Names below are as in both unless a version is given.
 X11 only: `Surface::drawScaled()` exists only in `Surface_X11.cxx`, so a Win32/macOS build
 would fail to link. Only X11 is supported.
 
@@ -12,14 +13,17 @@ would fail to link. Only X11 is supported.
 | `Scale` | `Off`, `Fit` (keep aspect, letterbox), `Stretch`, `Integer` | `Off` |
 | `ScaleFilter` | `Nearest`, `Linear`, `IntegerPlus` (used by Fit and Stretch only) | `Linear` |
 
-- Case-insensitive. An unknown value logs an error and falls back to `Off` / `Linear`.
+- Case-insensitive. 1.15.0 (`StringParameter`): an unknown value logs an error and falls back
+  to `Off` / `Linear`. 1.16.2 (`core::EnumParameter`): an unknown value is rejected when the
+  parameter is set, with an error, and the default stays.
 - **Command line only** (`vncviewer -Scale Fit -ScaleFilter IntegerPlus host`). They are not
   in `parameterArray` (`parameters.cxx`), so they are neither saved to nor loaded from
   `.tigervnc` files and are absent from the Options dialog. Adding them there is a separate
   item: a saved file would then carry names the stock viewer does not know.
 - `RemoteResize` (stock, also command line only) decides what happens with `Scale=Off`:
   resize the remote desktop to the window, or keep it and show scrollbars.
-- F8 menu, after "Resize window to session":
+- Context menu (F8 in 1.15.0; `Ctrl+Alt+M` in 1.16.2, whose `ShortcutModifiers` replaced
+  F8), after "Resize window to session":
   - `Display mode ▸` — one radio group, because the choices exclude each other:
     "Resize remote session" (`Scale=Off`, `RemoteResize=1`), "No resize (scrollbars)"
     (`Scale=Off`, `RemoteResize=0`), then "Scale to fit / stretch / by integer". The first
@@ -27,8 +31,9 @@ would fail to link. Only X11 is supported.
     (`supportsSetDesktopSize`).
   - `Scale filter ▸` — inactive unless the mode is Fit or Stretch.
   - Changes set the parameters in memory and last for the session.
-  - `DesktopWindow::updateScaling()` sends one `remoteResize(w(), h())` whenever the result
-    is "Resize remote session" and the remote size differs from the window.
+  - `DesktopWindow::updateScaling()` sends one remote resize to the window size whenever the
+    result is "Resize remote session" (1.15.0: `remoteResize(w(), h())` when the sizes differ;
+    1.16.2: `remoteResize()`, which itself skips an unchanged layout).
 - `Integer` ignores the filter: nearest at `floor(min(window / framebuffer))`; when the window
   is smaller than the remote it shrinks like `Fit` with linear.
 - `IntegerPlus` falls back to nearest at exact integer factors and to linear when shrinking.
@@ -54,7 +59,7 @@ would fail to link. Only X11 is supported.
   framebuffer size, then the stock centring/scrolling code runs.
 - **Geometry.** `Viewport::updateScale()` parses the two parameters and computes `scaleX/Y`
   and `imageRect` (image area relative to the widget, centred). Called on widget resize,
-  framebuffer resize, and `DesktopWindow::updateScaling()` (F8 menu).
+  framebuffer resize, and `DesktopWindow::updateScaling()` (context menu).
 - **Drawing.** On X11 `DesktopWindow::draw()` always renders into its `offscreen` Surface via
   `Viewport::draw(Surface*)`, which branches to `Viewport::drawScaled()`. The overlay and stats
   graph are blended afterwards in window space, so they stay unscaled.
@@ -75,9 +80,12 @@ would fail to link. Only X11 is supported.
   `intermediateStale` forces a full pass 1 after a mode/filter change, a framebuffer
   reallocation, a change of N, or whenever another path drew instead (the intermediate is not
   maintained there).
-- **RemoteResize** is suspended while scaling in three places in `DesktopWindow.cxx`: the
-  window `resize()` timer, `handleDesktopSize()` on the first update (an explicit
-  `DesktopSize` is still honoured), and edge scrolling (`handle()`, `handleEdgeScroll()`).
+- **RemoteResize** is suspended while scaling in `DesktopWindow.cxx`; an explicit
+  `DesktopSize` is still sent once, as without scaling. 1.15.0: in the window `resize()` timer
+  and in `handleDesktopSize()` on the first update. 1.16.2: upstream funnels every request
+  through `remoteResize()` (rate limited, one pending at a time), so the check is there once,
+  as `isScaling() && (sentDesktopSize || DesktopSize empty)`. Both: edge scrolling is off while
+  scaling (`handle()`, `handleEdgeScroll()`).
 - "Resize window to session" uses `fbWidth()/fbHeight()`.
 
 ## Testing
@@ -87,12 +95,16 @@ resizes, :92 viewer screen, :93 remote accepting resizes) and checks, with exit 
 failures: Off vs stock viewer pixel parity at three window sizes; nearest/integer/stretch/
 letterbox output equal to ImageMagick references (linear and IntegerPlus within 4/255);
 pointer mapping at corners and edges; partial updates (a remote window moved twice) equal to
-a fresh viewer for every mode; live window resize; F8 menu switching with RemoteResize
+a fresh viewer for every mode; live window resize; context menu switching with RemoteResize
 suspend/restore and Display mode switching (remote / no resize / fit); server-side resize
-while scaling. The parity checks are skipped when `/usr/bin/xtigervncviewer` is absent; a
-viewer whose window never appears is reported as FAIL rather than hanging `xwininfo`.
-Last run: 2026-10-21, 0 failures (also on a build from the upstream `v1.15.0` tag, parity
-skipped).
+while scaling. The menu key (F8 or `Ctrl+Alt+M`) is picked by whether the viewer's `--help`
+lists `ShortcutModifiers`. The parity checks compare with `$STOCK` (default
+`/usr/bin/xtigervncviewer`) and are skipped when it is absent; for 1.16.2 use an unpatched
+1.16.2 build. A viewer whose window never appears is reported as FAIL rather than hanging
+`xwininfo`.
+Last run: 2026-11-24, 0 failures on both versions (1.16.2 with parity against an unpatched
+1.16.2 build; 1.15.0 with parity skipped, no distro viewer installed; parity last passed
+2026-10-21).
 
 Traps found while writing it (all are test-environment issues, not viewer bugs):
 
@@ -103,13 +115,14 @@ Traps found while writing it (all are test-environment issues, not viewer bugs):
 - A fresh Xvnc ignores pointer motion relayed by a viewer until the first button event (stock
   viewer too); the script clicks once first.
 - No window manager on :92/:91: windows carry no `_NET_WM_PID` (find xmessage by
-  `--class`), F8 reaches the viewer only after `xdotool windowfocus`, and
+  `--class`), the menu key reaches the viewer only after `xdotool windowfocus`, and
   `import -window <id>` returns black — crop the root window instead.
-- Capture only after the 4 s "Press F8" overlay has faded, and never run two viewers at the
+- Capture only after the 4 s "Press F8" / "Press Ctrl+Alt+M" overlay has faded, and never run two viewers at the
   same position.
 - Stopping the Xvnc servers by `pkill -f "Xvnc :91"` also kills the calling shell (its own
   command line matches); kill by PID.
 
 Not covered by the script (it renders with pixman on the CPU in Xvnc). Checked by hand on the
-real KDE desktop on 2026-10-21, in scale mode: clipboard both ways, Korean input through
-fcitx5-hangul running in the remote session, and fullscreen. Still unchecked: HiDPI.
+real KDE desktop on 2026-10-21 (1.15.0), in scale mode: clipboard both ways, Korean input
+through fcitx5-hangul running in the remote session, and fullscreen. Repeated on 2026-11-24
+with 1.16.2 (also `Ctrl+Alt+M` menu switching and live resize): all work. Still unchecked: HiDPI.
